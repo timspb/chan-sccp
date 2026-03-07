@@ -92,6 +92,11 @@ _Note: When you are making changes to configure.ac, autoconf / or Makefile.am fi
 ### Build and Install
     make -j2 && make install && make reload
 
+### Recent Stability Fixes (2026-03-07)
+- Fixed global video preferences rendering to use the correct video array length in `src/sccp_cli.c`.
+- Fixed ACL/Localnet formatting to avoid duplicated address/mask output caused by thread-local stringify buffers in `src/sccp_utils.c`.
+- Fixed RTP debug path formatting to avoid duplicated endpoint output for the same reason in `src/sccp_rtp.c`.
+
 ### Required Asterisk Modules
 
 Make sure you have the following asterisk modules loaded before loading the chan_sccp

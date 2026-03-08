@@ -2520,6 +2520,20 @@ static boolean_t sccp_astwrap_createRtpInstance(constDevicePtr d, constChannelPt
 	ast_rtp_instance_set_qos(instance, tos, cos, "SCCP RTP");
 
 	if (rtp->type == SCCP_RTP_AUDIO) {
+		/* Ensure static RTP payload mappings exist for core narrowband codecs. */
+		ast_rtp_codecs_payloads_set_m_type(ast_rtp_instance_get_codecs(instance), instance, 0);
+		ast_rtp_codecs_payloads_set_rtpmap_type(ast_rtp_instance_get_codecs(instance), instance, 0, "audio", "PCMU", (enum ast_rtp_options)0);
+		ast_rtp_codecs_payloads_set_m_type(ast_rtp_instance_get_codecs(instance), instance, 3);
+		ast_rtp_codecs_payloads_set_rtpmap_type(ast_rtp_instance_get_codecs(instance), instance, 3, "audio", "GSM", (enum ast_rtp_options)0);
+		ast_rtp_codecs_payloads_set_m_type(ast_rtp_instance_get_codecs(instance), instance, 4);
+		ast_rtp_codecs_payloads_set_rtpmap_type(ast_rtp_instance_get_codecs(instance), instance, 4, "audio", "G723", (enum ast_rtp_options)0);
+		ast_rtp_codecs_payloads_set_m_type(ast_rtp_instance_get_codecs(instance), instance, 8);
+		ast_rtp_codecs_payloads_set_rtpmap_type(ast_rtp_instance_get_codecs(instance), instance, 8, "audio", "PCMA", (enum ast_rtp_options)0);
+		ast_rtp_codecs_payloads_set_m_type(ast_rtp_instance_get_codecs(instance), instance, 9);
+		ast_rtp_codecs_payloads_set_rtpmap_type(ast_rtp_instance_get_codecs(instance), instance, 9, "audio", "G722", (enum ast_rtp_options)0);
+		ast_rtp_codecs_payloads_set_m_type(ast_rtp_instance_get_codecs(instance), instance, 18);
+		ast_rtp_codecs_payloads_set_rtpmap_type(ast_rtp_instance_get_codecs(instance), instance, 18, "audio", "G729", (enum ast_rtp_options)0);
+
 		sccp_log(DEBUGCAT_CODEC)(VERBOSE_PREFIX_2 "%s: update rtpmap: format:%s, payload:%d, mime:%s, rate:%d\n",
 			c->designator, "CISCO-DTMF", 101, "audio", 0);
 		ast_rtp_codecs_payloads_set_m_type(ast_rtp_instance_get_codecs(instance), instance, 101);

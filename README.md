@@ -4,6 +4,11 @@ This repository contains the working chan-sccp driver for Cisco SCCP phones on A
 
 It is a compact fork-focused README with the basics only: build, install, and use.
 
+Known-good target range for this fork:
+
+- FreePBX 16 or 17
+- Asterisk 21 / 22 / 23
+
 ## What this project is for
 
 - Cisco SCCP/Skinny phone support in Asterisk
@@ -54,4 +59,3 @@ make reload
 - If `./configure` fails, make sure the development packages are installed.
 - If the build cannot find Asterisk headers, install the matching Asterisk dev package for your version.
 - If the driver does not load, check Asterisk module loading and log output first.
-

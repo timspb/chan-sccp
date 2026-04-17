@@ -2,6 +2,8 @@
 
 This repository contains the working chan-sccp driver for Cisco SCCP phones on Asterisk.
 
+**Working driver:** [timspb/chan-sccp](https://github.com/timspb/chan-sccp)
+
 It is a compact fork-focused README with the basics only: build, install, and use.
 
 English | [Русский](README.ru.md)
@@ -10,8 +12,6 @@ Known-good target range for this fork:
 
 - FreePBX 16 or 17
 - Asterisk 21 / 22 / 23
-
-Working driver: [timspb/chan-sccp](https://github.com/timspb/chan-sccp)
 
 ## What this project is for
 

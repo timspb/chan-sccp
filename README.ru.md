@@ -2,6 +2,8 @@
 
 Этот репозиторий содержит рабочую сборку драйвера chan-sccp для телефонов Cisco SCCP в Asterisk.
 
+**Рабочий драйвер:** [timspb/chan-sccp](https://github.com/timspb/chan-sccp)
+
 Это короткий README для форка: только сборка, установка и базовое использование.
 
 [English](README.md) | Русский
@@ -10,8 +12,6 @@
 
 - FreePBX 16 или 17
 - Asterisk 21 / 22 / 23
-
-Рабочий драйвер: [timspb/chan-sccp](https://github.com/timspb/chan-sccp)
 
 ## Для чего проект
 

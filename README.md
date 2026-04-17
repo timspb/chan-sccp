@@ -11,6 +11,8 @@ Known-good target range for this fork:
 - FreePBX 16 or 17
 - Asterisk 21 / 22 / 23
 
+Working driver: [timspb/chan-sccp](https://github.com/timspb/chan-sccp)
+
 ## What this project is for
 
 - Cisco SCCP/Skinny phone support in Asterisk

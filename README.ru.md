@@ -11,6 +11,8 @@
 - FreePBX 16 или 17
 - Asterisk 21 / 22 / 23
 
+Рабочий драйвер: [timspb/chan-sccp](https://github.com/timspb/chan-sccp)
+
 ## Для чего проект
 
 - Поддержка Cisco SCCP/Skinny телефонов в Asterisk

@@ -4,6 +4,8 @@ This repository contains the working chan-sccp driver for Cisco SCCP phones on A
 
 It is a compact fork-focused README with the basics only: build, install, and use.
 
+Russian version: [README.ru.md](README.ru.md)
+
 Known-good target range for this fork:
 
 - FreePBX 16 or 17

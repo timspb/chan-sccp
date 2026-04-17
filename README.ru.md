@@ -27,6 +27,13 @@
 
 Если в системе есть пакетный менеджер, сначала поставьте обычные dev-пакеты. Точные названия пакетов зависят от дистрибутива.
 
+Пример для Debian / Ubuntu:
+
+```bash
+sudo apt update && sudo apt install -y build-essential git autoconf libtool pkg-config gettext \
+  libxml2-dev libxslt1-dev libssl-dev libjansson-dev libsqlite3-dev
+```
+
 ## Сборка из исходников
 
 ```bash

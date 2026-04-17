@@ -27,6 +27,13 @@ Known-good target range for this fork:
 
 If your system uses a package manager, install the usual development packages first. Exact package names vary by Linux distribution.
 
+Example for Debian / Ubuntu:
+
+```bash
+sudo apt update && sudo apt install -y build-essential git autoconf libtool pkg-config gettext \
+  libxml2-dev libxslt1-dev libssl-dev libjansson-dev libsqlite3-dev
+```
+
 ## Build from source
 
 ```bash

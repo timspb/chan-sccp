@@ -65,6 +65,11 @@ void __sccp_session_stopthread(sessionPtr session, skinny_registrationstate_t ne
 gcc_inline void recalc_wait_time(sccp_session_t *s);
 static struct ast_sockaddr internip;
 
+AST_MUTEX_DEFINE_STATIC(session_lifecycle_lock);
+static pbx_cond_t session_lifecycle_drained = PTHREAD_COND_INITIALIZER;
+static unsigned int live_session_objects = 0;
+
+
 struct sccp_servercontext {
 	sccp_servercontexttype_t type;
 	const sccp_transport_t * transport;
@@ -158,6 +163,8 @@ struct sccp_session {
 	uint32_t protocolType;
 	volatile boolean_t session_stop;									/*!< Signal Session Stop */
 	sccp_mutex_t write_lock;										/*!< Prevent multiple threads writing to the socket at the same time */
+	unsigned int device_send_users;				/*!< Atomic; GLOB(sessions) guards new users */
+	pbx_cond_t device_send_drained;				/*!< Signalled under session lock when last user exits */
 	sccp_mutex_t lock;											/*!< Asterisk: Lock Me Up and Tie me Down */
 	pthread_t session_thread;										/*!< Session Thread */
 	struct sockaddr_storage ourip;										/*!< Our IP is for rtp use */
@@ -223,6 +230,77 @@ boolean_t sccp_session_getOurIP(constSessionPtr session, struct sockaddr_storage
 		}
 	}
 	return FALSE;
+}
+
+/*
+ * Obtain a stable copy of the owning session IP while holding the lock
+ * protecting device->session and the list membership. Never return the
+ * raw session pointer to an asynchronous endpoint notification.
+ */
+boolean_t sccp_session_getDeviceOurIP(constDevicePtr device,
+		struct sockaddr_storage * const sockAddrStorage, int family)
+{
+	sccp_session_t *it = NULL;
+	boolean_t result = FALSE;
+	if (!device || !sockAddrStorage) {
+		return FALSE;
+	}
+	SCCP_RWLIST_RDLOCK(&GLOB(sessions));
+	SCCP_RWLIST_TRAVERSE(&GLOB(sessions), it, list) {
+		if (it == device->session && it->device == device) {
+			result = sccp_session_getOurIP(it, sockAddrStorage, family);
+			break;
+		}
+	}
+	SCCP_RWLIST_UNLOCK(&GLOB(sessions));
+	return result;
+}
+
+/* The global sessions lock protects both list membership and device ownership.
+ * Return only a copied address, never a borrowed session pointer. */
+boolean_t sccp_session_getDeviceSas(constDevicePtr device, struct sockaddr_storage * const address)
+{
+	sccp_session_t *it = NULL;
+	boolean_t result = FALSE;
+	if (!device || !address) return FALSE;
+	SCCP_RWLIST_RDLOCK(&GLOB(sessions));
+	SCCP_RWLIST_TRAVERSE(&GLOB(sessions), it, list) {
+		if (device->session == it && it->device == device) {
+			result = sccp_session_getSas(it, address);
+			break;
+		}
+	}
+	SCCP_RWLIST_UNLOCK(&GLOB(sessions));
+	return result;
+}
+
+/* Increment the lifetime pin while the owning session is guaranteed live.
+ * Callers MUST balance successful pins with releasePinnedSession(), and must
+ * not wait for their own session's worker cleanup while keeping a pin. */
+sccp_session_t *sccp_session_pinDeviceSession(constDevicePtr device)
+{
+	sccp_session_t *it = NULL, *result = NULL;
+	if (!device) return NULL;
+	SCCP_RWLIST_RDLOCK(&GLOB(sessions));
+	SCCP_RWLIST_TRAVERSE(&GLOB(sessions), it, list) {
+		if (it == device->session && it->device == device &&
+		    !__atomic_load_n(&it->session_stop, __ATOMIC_ACQUIRE)) {
+			__atomic_add_fetch(&it->device_send_users, 1, __ATOMIC_ACQ_REL);
+			result = it;
+			break;
+		}
+	}
+	SCCP_RWLIST_UNLOCK(&GLOB(sessions));
+	return result;
+}
+
+void sccp_session_releasePinnedSession(sccp_session_t *session)
+{
+	if (!session) return;
+	sccp_session_lock(session);
+	if (__atomic_sub_fetch(&session->device_send_users, 1, __ATOMIC_ACQ_REL) == 0)
+		pbx_cond_broadcast(&session->device_send_drained);
+	sccp_session_unlock(session);
 }
 
 boolean_t sccp_session_getSas(constSessionPtr session, struct sockaddr_storage * const sockAddrStorage)
@@ -311,9 +389,9 @@ static void socket_get_error(constSessionPtr s, const char * file, int line, con
 {
 	if (errno) {
 		if (errno == ECONNRESET) {
-			sccp_log(DEBUGCAT_SOCKET)(VERBOSE_PREFIX_3 "%s: Connection reset by peer\n", DEV_ID_LOG(s->device));
+			sccp_log(DEBUGCAT_SOCKET)(VERBOSE_PREFIX_3 "%s: Connection reset by peer\n", s->designator);
 		} else {
-			sccp_log(DEBUGCAT_SOCKET)(VERBOSE_PREFIX_3 "%s (%s:%d:%s) Socket returned error: '%s (%d)')\n", DEV_ID_LOG(s->device), file, line, function, strerror(errno), errno);
+			sccp_log(DEBUGCAT_SOCKET)(VERBOSE_PREFIX_3 "%s (%s:%d:%s) Socket returned error: '%s (%d)')\n", s->designator, file, line, function, strerror(errno), errno);
 		}
 	} else {
 		if(!s || s->sc.fd <= 0) {
@@ -323,7 +401,7 @@ static void socket_get_error(constSessionPtr s, const char * file, int line, con
 		int error = 0;
 		socklen_t error_len = sizeof(error);
 		if ((mysocket && getsockopt(mysocket, SOL_SOCKET, SO_ERROR, &error, &error_len) == 0) && error != 0) {
-			sccp_log(DEBUGCAT_SOCKET)(VERBOSE_PREFIX_3 "%s: (%s:%d:%s) SO_ERROR: %s (%d)\n", DEV_ID_LOG(s->device), file, line, function, strerror(error), error);
+			sccp_log(DEBUGCAT_SOCKET)(VERBOSE_PREFIX_3 "%s: (%s:%d:%s) SO_ERROR: %s (%d)\n", s->designator, file, line, function, strerror(error), error);
 		}
 	}
 }
@@ -338,18 +416,18 @@ static int session_dissect_header(sccp_session_t * s, sccp_header_t * header, st
 	do {
 		// dissecting header to see if we have a valid sccp message, that we can handle
 		if (packetSize < 4 || packetSize > SCCP_MAX_PACKET - 8) {
-			pbx_log(LOG_ERROR, "%s: (session_dissect_header) Size of the data payload in the packet (messageId: %u, protocolVersion: %u / 0x0%x) is out of bounds: %d < %u > %d, close connection !\n", DEV_ID_LOG(s->device), messageId, protocolVersion, protocolVersion, 4, packetSize, (int) (SCCP_MAX_PACKET - 8));
+			pbx_log(LOG_ERROR, "%s: (session_dissect_header) Size of the data payload in the packet (messageId: %u, protocolVersion: %u / 0x0%x) is out of bounds: %d < %u > %d, close connection !\n", s->designator, messageId, protocolVersion, protocolVersion, 4, packetSize, (int) (SCCP_MAX_PACKET - 8));
 			return -2;
 		}
 
 		if (protocolVersion > 0 && !(sccp_protocol_isProtocolSupported(s->protocolType, protocolVersion))) {
-			pbx_log(LOG_ERROR, "%s: (session_dissect_header) protocolversion %u is unknown, cancelling read.\n", DEV_ID_LOG(s->device), protocolVersion);
+			pbx_log(LOG_ERROR, "%s: (session_dissect_header) protocolversion %u is unknown, cancelling read.\n", s->designator, protocolVersion);
 			break;
 		}
 
 		if((msginfo = lookupMsgInfoStruct(messageId))) {
 			if(msginfo->messageId != messageId) {
-				pbx_log(LOG_ERROR, "%s: (session_dissect_header) messageId %d (0x%x) unknown. matched:0x%x discarding message.\n", DEV_ID_LOG(s->device), messageId, messageId, msginfo->messageId);
+				pbx_log(LOG_ERROR, "%s: (session_dissect_header) messageId %d (0x%x) unknown. matched:0x%x discarding message.\n", s->designator, messageId, messageId, msginfo->messageId);
 				break;
 			}
 			result = msginfo->size + SCCP_PACKET_HEADER;
@@ -376,13 +454,13 @@ static gcc_inline int session_buffer2msg(sccp_session_t * s, const unsigned char
 		lenAccordingToOurProtocolSpec = 0;									// unknown message, read it and discard content completely
 	}
 	if (dont_expect(lenAccordingToPacketHeader > lenAccordingToOurProtocolSpec)) {					// show out discarded bytes
-		pbx_log(LOG_WARNING, "%s: (session_dissect_msg) Incoming message is bigger(%d) than known size(%d). Packet looks like!\n", DEV_ID_LOG(s->device), lenAccordingToPacketHeader, lenAccordingToOurProtocolSpec);
+		pbx_log(LOG_WARNING, "%s: (session_dissect_msg) Incoming message is bigger(%d) than known size(%d). Packet looks like!\n", s->designator, lenAccordingToPacketHeader, lenAccordingToOurProtocolSpec);
 		// buffer[lenAccordingToPacketHeader + 1] = '\0';								// terminate buffer
 		sccp_dump_packet(buffer, lenAccordingToPacketHeader);
 	}
 	
 	if (((unsigned int)lenAccordingToPacketHeader) < ((unsigned int)lenAccordingToOurProtocolSpec)){
-		sccp_log_and((DEBUGCAT_SOCKET + DEBUGCAT_MESSAGE)) (VERBOSE_PREFIX_3 "%s: (session_dissect_msg) Incoming message is smaller(%d) than known size(%d).\n", DEV_ID_LOG(s->device), lenAccordingToPacketHeader, lenAccordingToOurProtocolSpec);
+		sccp_log_and((DEBUGCAT_SOCKET + DEBUGCAT_MESSAGE)) (VERBOSE_PREFIX_3 "%s: (session_dissect_msg) Incoming message is smaller(%d) than known size(%d).\n", s->designator, lenAccordingToPacketHeader, lenAccordingToOurProtocolSpec);
 		lenAccordingToOurProtocolSpec = lenAccordingToPacketHeader;
 	}
 
@@ -396,7 +474,7 @@ static gcc_inline int session_buffer2msg(sccp_session_t * s, const unsigned char
 	// check response after handling message
 	if(msginfo && msginfo->type == SKINNY_MSGTYPE_RESPONSE) {
 		response_received(s);
-		sccp_log(DEBUGCAT_SOCKET)(VERBOSE_PREFIX_3 "%s: Response '%s' Received\n", DEV_ID_LOG(s->device), msginfo->text);
+		sccp_log(DEBUGCAT_SOCKET)(VERBOSE_PREFIX_3 "%s: Response '%s' Received\n", s->designator, msginfo->text);
 	}
 	return res;
 }
@@ -413,7 +491,7 @@ static gcc_inline int process_buffer(sccp_session_t * s, sccp_msg_t * msg, unsig
 		}
 
 		if (dont_expect(payload_len < SCCP_PACKET_HEADER || payload_len > SCCP_MAX_PACKET)) {
-			pbx_log(LOG_ERROR, "%s: (process_buffer) Size of the data payload in the packet is bigger than max packet, close connection !\n", DEV_ID_LOG(s->device));
+			pbx_log(LOG_ERROR, "%s: (process_buffer) Size of the data payload in the packet is bigger than max packet, close connection !\n", s->designator);
 			res = -1;
 			break;
 		}
@@ -513,25 +591,36 @@ static boolean_t sccp_session_removeFromGlobals(sccp_session_t * s)
  *      - socket_lock
  *      - Glob(sessions)
  */
-void sccp_session_terminateAll()
+/* Accept threads must have been stopped before quiescing.  Never sleep while
+ * holding GLOB(sessions): worker teardown needs its writer lock. */
+void sccp_session_quiesceAll(void)
 {
-	sccp_session_t *s = NULL;
+	sccp_session_t *it = NULL;
+	SCCP_RWLIST_RDLOCK(&GLOB(sessions));
+	SCCP_RWLIST_TRAVERSE(&GLOB(sessions), it, list) {
+		__atomic_store_n(&it->session_stop, TRUE, __ATOMIC_RELEASE);
+		if (it->sc.fd > 0) shutdown(it->sc.fd, SHUT_RDWR);
+	}
+	SCCP_RWLIST_UNLOCK(&GLOB(sessions));
 
-	sccp_log((DEBUGCAT_CORE)) (VERBOSE_PREFIX_2 "SCCP: Removing Sessions\n");
-	SCCP_RWLIST_TRAVERSE_SAFE_BEGIN(&GLOB(sessions), s, list) {
-		sccp_session_stopthread(s, SKINNY_DEVICE_RS_NONE);
+	pbx_mutex_lock(&session_lifecycle_lock);
+	while (live_session_objects != 0) {
+		pbx_cond_wait(&session_lifecycle_drained, &session_lifecycle_lock);
 	}
-	SCCP_RWLIST_TRAVERSE_SAFE_END;
-	
-	/* give remote phone a time to close the socket */
-	int waitloop = 10;
-	while (!SCCP_LIST_EMPTY(&GLOB(sessions)) && waitloop-- > 0) {
-		usleep(100);
-	}
+	pbx_mutex_unlock(&session_lifecycle_lock);
+}
 
-	if (SCCP_LIST_EMPTY(&GLOB(sessions))) {
-		SCCP_RWLIST_HEAD_DESTROY(&GLOB(sessions));
+void sccp_session_terminateAll(void)
+{
+	sccp_session_quiesceAll();
+	SCCP_RWLIST_WRLOCK(&GLOB(sessions));
+	if (!SCCP_LIST_EMPTY(&GLOB(sessions))) {
+		pbx_log(LOG_ERROR, "SCCP: live session list nonempty after quiescence; not destroying list\n");
+		SCCP_RWLIST_UNLOCK(&GLOB(sessions));
+		return;
 	}
+	SCCP_RWLIST_UNLOCK(&GLOB(sessions));
+	SCCP_RWLIST_HEAD_DESTROY(&GLOB(sessions));
 }
 
 /*!
@@ -542,16 +631,38 @@ static sccp_device_t *__sccp_session_removeDevice(sessionPtr session)
 {
 	sccp_device_t *return_device = NULL;
 
-	if (session && (return_device = session->device)) {
-		if (return_device->session && return_device->session != session) {
-			sccp_session_removeFromGlobals(return_device->session);
-		}
-		sccp_device_setRegistrationState(return_device, SKINNY_DEVICE_RS_NONE);
+	boolean_t owned = FALSE;
+	boolean_t clear_transition = FALSE;
+	if (!session) {
+		return NULL;
 	}
+	/* Lock order must be global sessions -> session: the CLI traverses
+	 * sessions while holding the list lock and then takes session->lock.
+	 * Never invert this order during detach. */
+	SCCP_RWLIST_WRLOCK(&GLOB(sessions));
 	sccp_session_lock(session);
+	return_device = session->device;
+	if (return_device && return_device->session == session) {
+		return_device->session = NULL;
+		if (!return_device->cleanup_in_progress) {
+			return_device->session_owner_transition = TRUE;
+			clear_transition = TRUE;
+		}
+		owned = TRUE;
+	}
 	sccp_copy_string(session->designator, sccp_netsock_stringify(&session->ourip), sizeof(session->designator));
 	session->device = NULL;
 	sccp_session_unlock(session);
+	SCCP_RWLIST_UNLOCK(&GLOB(sessions));
+	if (owned) {
+		sccp_device_setRegistrationState(return_device, SKINNY_DEVICE_RS_NONE);
+		if (clear_transition) {
+			SCCP_RWLIST_WRLOCK(&GLOB(sessions));
+			if (!return_device->cleanup_in_progress)
+				return_device->session_owner_transition = FALSE;
+			SCCP_RWLIST_UNLOCK(&GLOB(sessions));
+		}
+	}
 	return return_device;
 }
 
@@ -565,26 +676,45 @@ static int __sccp_session_addDevice(sessionPtr session, constDevicePtr device)
 {
 	int res = 0;
 	sccp_device_t *new_device = NULL;
-	if (session && (!device || (device && session->device != device))) {
-		sccp_session_lock(session);
-		new_device = sccp_device_retain(device);				/* do this before releasing anything, to prevent device cleanup if the same */
-		if (session->device) {
-			AUTO_RELEASE(sccp_device_t, remDevice, __sccp_session_removeDevice(session)); /* implicit release */
-		}
-		if (device) {
-			if (new_device) {
-				session->device = new_device;				/* keep newly retained device */
-				session->device->session = session;			/* update device session pointer */
 
-				char buf[16] = "";
-				snprintf(buf, 16, "%s:%d", device->id, session->sc.fd);
-				sccp_copy_string(session->designator, buf, sizeof(session->designator));
-				res = 1;
-			} else {
-				res = -1;
-			}
+	if (!session) {
+		return 0;
+	}
+	/* Retain the target before releasing a possibly identical device. */
+	if (device) {
+		new_device = sccp_device_retain(device);
+		if (!new_device) {
+			return -1;
 		}
-		sccp_session_unlock(session);
+	}
+
+	/* A live session cannot silently switch to another device. Detach of
+	 * a stale snapshot could otherwise release a newer registration. */
+	SCCP_RWLIST_WRLOCK(&GLOB(sessions));
+	sccp_session_lock(session);
+	if (new_device) {
+		if (session->device == new_device) {
+			res = 0;
+		} else if (!session->device &&
+			   ((!new_device->session && !new_device->session_owner_transition && !new_device->cleanup_in_progress) || new_device->session == session)) {
+			session->device = new_device;
+			new_device->session = session;
+			res = 1;
+		} else {
+			res = -1;
+		}
+	} else {
+		res = 0;
+	}
+	if (res == 1) {
+		char buf[16] = "";
+		snprintf(buf, 16, "%s:%d", device->id, session->sc.fd);
+		sccp_copy_string(session->designator, buf, sizeof(session->designator));
+	}
+	sccp_session_unlock(session);
+	SCCP_RWLIST_UNLOCK(&GLOB(sessions));
+	if (res != 1 && new_device) {
+		sccp_device_release(&new_device);
 	}
 	return res;
 }
@@ -596,7 +726,7 @@ static int __sccp_session_addDevice(sessionPtr session, constDevicePtr device)
  */
 int sccp_session_retainDevice(constSessionPtr session, constDevicePtr device)
 {
-	if (session && (!device || (device && session->device != device))) {
+	if (session) {
 		sessionPtr s = (sessionPtr)session;									/* discard const */
 		sccp_log((DEBUGCAT_DEVICE))(VERBOSE_PREFIX_3 "%s: Allocating device to session (%d) %s\n", DEV_ID_LOG(device), s->sc.fd, sccp_netsock_stringify_addr(&s->sin));
 		return __sccp_session_addDevice(s, device);
@@ -631,19 +761,39 @@ static void destroy_session(sccp_session_t * s)
 		return;
 	}
 
+	/* The owner is exiting.  Interrupt in-flight blocking send() before
+	 * invoking device cleanup, which may itself send notifications.  Use
+	 * the OS socket shutdown here rather than TLS shutdown: SSL_shutdown
+	 * is not safe concurrently with another thread's SSL_write.  The
+	 * transport teardown still runs after all pinned writers drain. */
+	sccp_session_lock(s);
+	__atomic_store_n(&s->session_stop, TRUE, __ATOMIC_RELEASE);
+	if (s->sc.fd > 0) {
+		shutdown(s->sc.fd, SHUT_RDWR);
+	}
+	sccp_session_unlock(s);
+
 	char addrStr[INET6_ADDRSTRLEN];
 	sccp_copy_string(addrStr, sccp_netsock_stringify_addr(&s->sin), sizeof(addrStr));
-	AUTO_RELEASE(sccp_device_t, d , s->device ? sccp_device_retain(s->device) : NULL);
+	AUTO_RELEASE(sccp_device_t, d, sccp_session_getDevice(s, FALSE));
 	if (d) {
-		sccp_log((DEBUGCAT_SOCKET)) (VERBOSE_PREFIX_3 "%s: Destroy Device Session %s\n", DEV_ID_LOG(s->device), addrStr);
-		d->session = NULL;
-		sccp_dev_clean(d, (d->realtime) ? TRUE : FALSE);
+		/* Revalidate ownership inside the exclusive device-cleanup gate.
+		 * A newer session must never be cleaned by this exiting worker. */
+		_sccp_dev_clean_owned(d, d->realtime ? TRUE : FALSE, FALSE, s);
 	}
 	sccp_session_releaseDevice(s);
 
 	if (!sccp_session_removeFromGlobals(s)) {
-		sccp_log((DEBUGCAT_SOCKET)) (VERBOSE_PREFIX_3 "%s: Session could not be found in GLOB(session) %s\n", DEV_ID_LOG(s->device), addrStr);
+		sccp_log((DEBUGCAT_SOCKET)) (VERBOSE_PREFIX_3 "%s: Session could not be found in GLOB(session) %s\n", s->designator, addrStr);
 	}
+	/* Once unlinked, neither device sends nor direct session sends can pin
+	 * the object.  The socket was shutdown above, so blocked send() calls
+	 * should return before the worker frees the session. */
+	sccp_session_lock(s);
+	while (__atomic_load_n(&s->device_send_users, __ATOMIC_ACQUIRE) != 0) {
+		pbx_cond_wait(&s->device_send_drained, &s->lock);
+	}
+	sccp_session_unlock(s);
 	
 	if (s) {
 		sccp_log((DEBUGCAT_SOCKET)) (VERBOSE_PREFIX_3 "SCCP: Destroy Session %s\n", addrStr);
@@ -662,9 +812,13 @@ static void destroy_session(sccp_session_t * s)
 		sccp_mutex_destroy(&s->lock);
 		sccp_mutex_destroy(&s->write_lock);
 		pbx_cond_destroy(&s->pendingRequest);
+		pbx_cond_destroy(&s->device_send_drained);
 		sccp_free(s);
 		s = NULL;
 	}
+	pbx_mutex_lock(&session_lifecycle_lock);
+	if (--live_session_objects == 0) pbx_cond_broadcast(&session_lifecycle_drained);
+	pbx_mutex_unlock(&session_lifecycle_lock);
 }
 
 /*!
@@ -678,19 +832,20 @@ void sccp_session_device_thread_exit(void *session)
 {
 	sccp_session_t *s = (sccp_session_t *) session;
 
-	if (!s->device) {
+	AUTO_RELEASE(sccp_device_t, exit_device, sccp_session_getDevice(s, FALSE));
+	if (!exit_device) {
 		sccp_log(DEBUGCAT_SOCKET) (VERBOSE_PREFIX_3 "SCCP: Session without a device attached !\n");
 	}
 
-	sccp_log((DEBUGCAT_SOCKET)) (VERBOSE_PREFIX_3 "%s: cleanup session\n", DEV_ID_LOG(s->device));
+	sccp_log((DEBUGCAT_SOCKET)) (VERBOSE_PREFIX_3 "%s: cleanup session\n", s->designator);
 	sccp_session_lock(s);
-	s->session_stop = TRUE;
+	__atomic_store_n(&s->session_stop, TRUE, __ATOMIC_RELEASE);
 	/*	if (s->sc.fd > 0) {
 			s->srvcontext->transport->close(&s->sc);
 			s->sc.fd = -1;
 		}*/
 	sccp_session_unlock(s);
-	s->session_thread = AST_PTHREADT_NULL;
+	__atomic_store_n(&s->session_thread, AST_PTHREADT_NULL, __ATOMIC_RELEASE);
 	destroy_session(s);
 }
 
@@ -699,7 +854,7 @@ gcc_inline void recalc_wait_time(sccp_session_t *s)
 	float keepaliveAdditionalTimePercent = KEEPALIVE_ADDITIONAL_PERCENT_SESSION;
 	float keepAlive = GLOB(keepalive);
 	float keepAliveInterval = GLOB(keepalive);
-	sccp_device_t *d = s->device;
+	AUTO_RELEASE(sccp_device_t, d, sccp_session_getDevice(s, FALSE));
 	if (d) {
 		keepAlive = d->keepalive;
 		keepAliveInterval = d->keepaliveinterval;
@@ -758,38 +913,45 @@ void *sccp_session_device_thread(void *session)
 	fds[0].revents = 0;
 	fds[0].fd = s->sc.fd;
 
-	while(s->sc.fd > 0 && !s->session_stop) {
-		if (s->device) {
-			sccp_device_t *d = s->device;
-			if (d->pendingUpdate || d->pendingDelete) {
-				pbx_rwlock_rdlock(&GLOB(lock));
-				boolean_t reload_in_progress = GLOB(reload_in_progress);
-				pbx_rwlock_unlock(&GLOB(lock));
-				if(reload_in_progress == FALSE && sccp_device_check_update(d)) {
-					continue;
+	while(s->sc.fd > 0 && !__atomic_load_n(&s->session_stop, __ATOMIC_ACQUIRE)) {
+		/* The device may be detached concurrently by a reload or cleanup.
+		 * Keep an independent retained reference only for this iteration's
+		 * device-related work (not for the potentially long poll). */
+		{
+			AUTO_RELEASE(sccp_device_t, d, sccp_session_getDevice(s, FALSE));
+			if (d) {
+				if (d->pendingUpdate || d->pendingDelete) {
+					pbx_rwlock_rdlock(&GLOB(lock));
+					boolean_t reload_in_progress = GLOB(reload_in_progress);
+					pbx_rwlock_unlock(&GLOB(lock));
+					if(reload_in_progress == FALSE && sccp_device_check_update(d)) {
+						continue;
+					}
+					sccp_safe_sleep(100);
+					/* No point using the old registration after a detach. */
+					AUTO_RELEASE(sccp_device_t, current_device, sccp_session_getDevice(s, FALSE));
+					if (current_device != d) {
+						continue;
+					}
 				}
-				sccp_safe_sleep(100);
-				if(!s->device) {
-					continue;
+				if ((d->active_channel ? TRUE : FALSE) != oncall) {
+					recalc_wait_time(s);
+					oncall = (d->active_channel) ? TRUE : FALSE;
 				}
-			}
-			if ((d->active_channel ? TRUE : FALSE) != oncall) {
-				recalc_wait_time(s);
-				oncall = (d->active_channel) ? TRUE : FALSE;
-			}
-			if (d->status.token == SCCP_TOKEN_STATE_ACK) {
-				tokenThread = TRUE;								// only does TCP-Keepalive
+				if (d->status.token == SCCP_TOKEN_STATE_ACK) {
+					tokenThread = TRUE;								// only does TCP-Keepalive
+				}
 			}
 		}
 		pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, NULL);
-		sccp_log_and((DEBUGCAT_SOCKET + DEBUGCAT_HIGH))(VERBOSE_PREFIX_4 "%s: set poll timeout %d for session %d\n", DEV_ID_LOG(s->device), (int)s->keepAliveInterval, fds[0].fd);
+		sccp_log_and((DEBUGCAT_SOCKET + DEBUGCAT_HIGH))(VERBOSE_PREFIX_4 "%s: set poll timeout %d for session %d\n", s->designator, (int)s->keepAliveInterval, fds[0].fd);
 
 		res = sccp_netsock_poll(fds, 1, s->keepAliveInterval * 1000);
 		pthread_testcancel();
 		pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
 		if (-1 == res) {										/* poll data processing */
 			if (errno > 0 && (errno != EAGAIN) && (errno != EINTR)) {
-				pbx_log(LOG_ERROR, "%s: poll() returned %d. errno: %s, (ip-address: %s)\n", DEV_ID_LOG(s->device), errno, strerror(errno), s->designator);
+				pbx_log(LOG_ERROR, "%s: poll() returned %d. errno: %s, (ip-address: %s)\n", s->designator, errno, strerror(errno), s->designator);
 				socket_get_error(s, __FILE__, __LINE__, __PRETTY_FUNCTION__);
 				__sccp_session_stopthread(s, SKINNY_DEVICE_RS_FAILED);
 				break;
@@ -797,13 +959,13 @@ void *sccp_session_device_thread(void *session)
 		} else if (0 == res) {										/* poll timeout */
 			uintmax_t timediff = (uintmax_t)time(0) - (uintmax_t)s->lastKeepAlive;
 			if (!tokenThread && timediff >= s->keepAlive) {
-				pbx_log(LOG_NOTICE, "%s: Closing session because connection timed out after %ju seconds (ip-address: %s).\n", DEV_ID_LOG(s->device), timediff, s->designator);
+				pbx_log(LOG_NOTICE, "%s: Closing session because connection timed out after %ju seconds (ip-address: %s).\n", s->designator, timediff, s->designator);
 				__sccp_session_stopthread(s, SKINNY_DEVICE_RS_TIMEOUT);
 				break;
 			}
 		} else if (res > 0) {										/* poll data processing */
 			if(fds[0].revents & POLLIN || fds[0].revents & POLLPRI) {                               /* POLLIN | POLLPRI */
-				// sccp_log_and((DEBUGCAT_SOCKET + DEBUGCAT_HIGH)) (VERBOSE_PREFIX_2 "%s: Session New Data Arriving at buffer position:%lu\n", DEV_ID_LOG(s->device), recv_len);
+				// sccp_log_and((DEBUGCAT_SOCKET + DEBUGCAT_HIGH)) (VERBOSE_PREFIX_2 "%s: Session New Data Arriving at buffer position:%lu\n", s->designator, recv_len);
 				int result       = s->srvcontext->transport->recv(&s->sc, recv_buffer + recv_len, (ARRAY_LEN(recv_buffer) * sizeof(unsigned char)) - recv_len, 0);
 				s->lastKeepAlive = time(0);
 				if (result <= 0) {
@@ -814,8 +976,9 @@ void *sccp_session_device_thread(void *session)
 				} else if (!((recv_len += result) && ((ARRAY_LEN(recv_buffer) * sizeof(unsigned char)) - recv_len) && process_buffer(s, &msg, recv_buffer, &recv_len) == 0)) {
 					pbx_log(LOG_ERROR, "%s: (netsock_device_thread) Received a packet or message (with result:%d) which we could not handle, giving up session: %p!\n", s->designator, result, s);
 					sccp_dump_msg(&msg);
-					if (s->device) {
-						sccp_device_sendReset(s->device, SKINNY_RESETTYPE_RESTART);
+					AUTO_RELEASE(sccp_device_t, reset_device, sccp_session_getDevice(s, FALSE));
+					if (reset_device) {
+						sccp_device_sendReset(reset_device, SKINNY_RESETTYPE_RESTART);
 					}
 					__sccp_session_stopthread(s, SKINNY_DEVICE_RS_FAILED);
 					break;
@@ -827,13 +990,13 @@ void *sccp_session_device_thread(void *session)
 				break;
 			}
 		} else {											/* poll returned invalid res */
-			pbx_log(LOG_NOTICE, "%s: Poll Returned invalid result: %d.\n", DEV_ID_LOG(s->device), res);
+			pbx_log(LOG_NOTICE, "%s: Poll Returned invalid result: %d.\n", s->designator, res);
 		}
 		pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, NULL);
 		pthread_testcancel();
 		pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
 	}
-	sccp_log((DEBUGCAT_SOCKET)) (VERBOSE_PREFIX_3 "%s: Exiting sccp_socket device thread\n", DEV_ID_LOG(s->device));
+	sccp_log((DEBUGCAT_SOCKET)) (VERBOSE_PREFIX_3 "%s: Exiting sccp_socket device thread\n", s->designator);
 	pthread_cleanup_pop(1);
 
 	return NULL;
@@ -846,53 +1009,46 @@ void __sccp_session_stopthread(sessionPtr s, skinny_registrationstate_t newRegis
 		pbx_log(LOG_NOTICE, "SCCP: session already terminated\n");
 		return;
 	}
-	sccp_log((DEBUGCAT_SOCKET))(VERBOSE_PREFIX_2 "%s: Stopping Session Thread\n", DEV_ID_LOG(s->device));
+	sccp_log((DEBUGCAT_SOCKET))(VERBOSE_PREFIX_2 "%s: Stopping Session Thread\n", s->designator);
 
-	s->session_stop = TRUE;
-	if(s->device) {
-		sccp_device_setRegistrationState(s->device, newRegistrationState);
-	}
-	if(AST_PTHREADT_NULL != s->session_thread) {
-		s->srvcontext->transport->shutdown(&s->sc, SHUT_RD);                                        // this will also wake up poll
+	/* The detached worker owns the registration state.  Do not update a
+	 * device here: a new registration may already own it, and state change
+	 * callbacks are not safe under the global sessions lock. */
+	(void)newRegistrationState;
+	__atomic_store_n(&s->session_stop, TRUE, __ATOMIC_RELEASE);
+	if(AST_PTHREADT_NULL != __atomic_load_n(&s->session_thread, __ATOMIC_ACQUIRE)) {
+		/* A raw socket shutdown wakes poll() without TLS SSL_shutdown() while
+		 * another worker could be using SSL_write(). */
+		if (s->sc.fd > 0) {
+			shutdown(s->sc.fd, SHUT_RD);
+		}                                        // this will also wake up poll
 													    // which is waiting for a read event and close down the thread nicely
 	}
 }
 
-/* cleanup session device thread from another thread */
-static void __sccp_netsock_end_device_thread(sccp_session_t *session)
-{
-	pthread_t session_thread = session->session_thread;
-	if (session_thread == AST_PTHREADT_NULL) {
-		return;
-	}
-
-	/* send thread cancellation (will interrupt poll if necessary) */
-	int s = pthread_cancel(session_thread);
-	if (s != 0) {
-		pbx_log(LOG_NOTICE, "SCCP: (sccp_netsock_end_device_thread) pthread_cancel error\n");
-	}
-
-	/* join previous session thread, wait for device cleanup */
-	void * res = NULL;
-	if (pthread_join(session_thread, &res) == 0) {
-		if (res != PTHREAD_CANCELED) {
-			pbx_log(LOG_ERROR, "SCCP: (sccp_netsock_end_device_thread) pthread join failed\n");
-		}
-	}
-}
-
-/* check if same or different thread, choose thread cancel method accordingly */
+/*
+ * Stop by identity under the list lock. A caller may hold only a borrowed
+ * pointer: do not dereference a possibly retired session before verifying
+ * membership in GLOB(sessions). Detached worker owns final destruction.
+ */
 gcc_inline void sccp_session_stopthread(constSessionPtr session, skinny_registrationstate_t newRegistrationState)
 {
-	sessionPtr s = (sessionPtr)session;										/* discard const */
-	if (s) {
-		pthread_t ptid = pthread_self();
-		if (ptid == s->session_thread) {
-			__sccp_session_stopthread(s, newRegistrationState);
-		} else {
-			__sccp_netsock_end_device_thread(s);
+	sccp_session_t *it = NULL;
+	(void)newRegistrationState;
+	if (!session) {
+		return;
+	}
+	SCCP_RWLIST_RDLOCK(&GLOB(sessions));
+	SCCP_RWLIST_TRAVERSE(&GLOB(sessions), it, list) {
+		if (it == session) {
+			__atomic_store_n(&it->session_stop, TRUE, __ATOMIC_RELEASE);
+			if (it->sc.fd > 0) {
+				shutdown(it->sc.fd, SHUT_RD);
+			}
+			break;
 		}
 	}
+	SCCP_RWLIST_UNLOCK(&GLOB(sessions));
 }
 
 static boolean_t sccp_session_new_socket_allowed(struct sockaddr_storage *sin)
@@ -925,6 +1081,7 @@ static sccp_session_t * sccp_create_session(sccp_servercontext_t * context, sccp
 
 	sccp_mutex_init(&s->lock);
 	pbx_cond_init(&s->pendingRequest, NULL);
+	pbx_cond_init(&s->device_send_drained, NULL);
 	sccp_mutex_init(&s->write_lock);
 
 	s->sc.fd = sc->fd;
@@ -933,7 +1090,9 @@ static sccp_session_t * sccp_create_session(sccp_servercontext_t * context, sccp
 	s->srvcontext = context;
 
 	s->lastKeepAlive = time(0);
-	
+	pbx_mutex_lock(&session_lifecycle_lock);
+	live_session_objects++;
+	pbx_mutex_unlock(&session_lifecycle_lock);
 	return s;
 }
 
@@ -1012,8 +1171,20 @@ static void * accept_thread(void * data)
 	
 		// Create a detached thread, since the sccp_session_device_thread will not be joined from another thread
 		// Only detached threads free their stack and control structures after termination, otherwise a pthread_join is mandatory for this to take place (davidded).
-		if (pbx_pthread_create_detached(&s->session_thread, NULL, sccp_session_device_thread, s)) {
-			destroy_session(s);
+		{
+			pthread_t new_thread = AST_PTHREADT_NULL;
+			int create_result;
+			/* The worker must acquire s->lock in its cleanup handler before
+			 * freeing s.  Holding it until the thread id is published prevents
+			 * pthread_create from writing into a freed session object. */
+			sccp_session_lock(s);
+			create_result = pbx_pthread_create_detached(&new_thread, NULL,
+							     sccp_session_device_thread, s);
+			if (!create_result) {
+				__atomic_store_n(&s->session_thread, new_thread, __ATOMIC_RELEASE);
+			}
+			sccp_session_unlock(s);
+			if (create_result) destroy_session(s);
 		}
 	}
 	context->transport->close(&new_sc);
@@ -1158,7 +1329,7 @@ boolean_t sccp_session_bind_and_listen(sccp_servercontext_t * context, struct so
  */
 void sccp_session_sendmsg(const sccp_device_t * device, sccp_mid_t t)
 {
-	if (!device || !device->session) {
+	if (!device) {
 		sccp_log((DEBUGCAT_SOCKET)) (VERBOSE_PREFIX_3 "SCCP: (sccp_session_sendmsg) No device available to send message to\n");
 		return;
 	}
@@ -1175,16 +1346,71 @@ void sccp_session_sendmsg(const sccp_device_t * device, sccp_mid_t t)
  * \param msg_in Message Data Structure (sccp_msg_t)
  * \return SCCP Session Send
  */
+/* Called only with a live session pinned by device_send_users, or by the
+ * owning session worker before it can execute its exit handler. */
+static int sccp_session_send2_pinned(constSessionPtr session, sccp_msg_t *msg);
+
+static void sccp_session_release_send_user(sccp_session_t *s)
+{
+	sccp_session_releasePinnedSession(s);
+}
+
+/*
+ * Clean up a device association without exposing an unpinned device->session
+ * pointer to sccp_device.c.  This function may be called by the owner worker
+ * itself: the pin is dropped before the worker reaches destroy_session's
+ * send-user drain. Never call this helper with GLOB(sessions) held.
+ */
+void sccp_session_cleanupDeviceSession(constDevicePtr device)
+{
+	sccp_session_t *s = NULL, *it = NULL;
+	if (!device) {
+		return;
+	}
+	SCCP_RWLIST_RDLOCK(&GLOB(sessions));
+	SCCP_RWLIST_TRAVERSE(&GLOB(sessions), it, list) {
+		if (it == device->session && it->device == device) {
+			s = it;
+			__atomic_add_fetch(&s->device_send_users, 1, __ATOMIC_ACQ_REL);
+			break;
+		}
+	}
+	SCCP_RWLIST_UNLOCK(&GLOB(sessions));
+	if (s) {
+		sccp_session_stopthread(s, SKINNY_DEVICE_RS_NONE);
+		sccp_session_releaseDevice(s);
+		sccp_session_release_send_user(s);
+	}
+}
+
 int sccp_session_send(constDevicePtr device, const sccp_msg_t * msg_in)
 {
-	//const sccp_session_t * const s = sccp_session_findByDevice(device);
 	sccp_msg_t *msg = (sccp_msg_t *) msg_in;				/* discard const * const */
-	const sccp_session_t * const s = device && device->session ? device->session : NULL;
+	sccp_session_t *s = NULL, *it = NULL;
+	int result = -1;
 
-	if (s && !s->session_stop) {
-		return sccp_session_send2(s, msg);
-	} 
-	return -1;
+	/* Validate the owner against the live session list and pin it before
+	 * releasing the lock.  Never hold the global list lock over network I/O.
+	 * Use an atomic increment here: addDevice acquires the session mutex
+	 * before the list lock, so grabbing it inside RDLOCK would deadlock. */
+	if (device) {
+		SCCP_RWLIST_RDLOCK(&GLOB(sessions));
+		SCCP_RWLIST_TRAVERSE(&GLOB(sessions), it, list) {
+			if (it == device->session && it->device == device && !__atomic_load_n(&it->session_stop, __ATOMIC_ACQUIRE)) {
+				s = it;
+				__atomic_add_fetch(&s->device_send_users, 1, __ATOMIC_ACQ_REL);
+				break;
+			}
+		}
+		SCCP_RWLIST_UNLOCK(&GLOB(sessions));
+	}
+	if (!s) {
+		sccp_free(msg);
+		return -1;
+	}
+	result = sccp_session_send2_pinned(s, msg);
+	sccp_session_release_send_user(s);
+	return result;
 }
 
 /*!
@@ -1196,7 +1422,7 @@ int sccp_session_send(constDevicePtr device, const sccp_msg_t * msg_in)
  * \lock
  *      - session
  */
-int sccp_session_send2(constSessionPtr session, sccp_msg_t * msg)
+static int sccp_session_send2_pinned(constSessionPtr session, sccp_msg_t * msg)
 {
 	sessionPtr s = (sessionPtr)session;										/* discard const */
 	ssize_t res = 0;
@@ -1204,8 +1430,19 @@ int sccp_session_send2(constSessionPtr session, sccp_msg_t * msg)
 	ssize_t bytesSent = 0;
 	ssize_t bufLen = 0;
 	uint8_t * bufAddr = NULL;
+	/* Session send pins the session, but detach can release session->device.
+	 * Retain a stable device reference before any protocol access or logging. */
+	AUTO_RELEASE(sccp_device_t, send_device, NULL);
+	if (s) {
+		sccp_session_lock(s);
+		if (s->device) {
+			send_device = sccp_device_retain(s->device);
+		}
+		sccp_session_unlock(s);
+	}
 
-	if (s && s->session_stop) {
+	if (s && __atomic_load_n(&s->session_stop, __ATOMIC_ACQUIRE)) {
+		sccp_free(msg);
 		return -2;
 	}
 
@@ -1220,8 +1457,8 @@ int sccp_session_send2(constSessionPtr session, sccp_msg_t * msg)
 	}
 	if (msgid == KeepAliveAckMessage || msgid == RegisterAckMessage || msgid == UnregisterAckMessage) {
 		msg->header.lel_protocolVer = 0;
-	} else if (s->device && s->device->protocol) {
-		msg->header.lel_protocolVer = s->device->protocol->version < 10 ? 0 : htolel(s->device->protocol->version);
+	} else if (send_device && send_device->protocol) {
+		msg->header.lel_protocolVer = send_device->protocol->version < 10 ? 0 : htolel(send_device->protocol->version);
 	}
 
 	uint backoff = WRITE_BACKOFF;
@@ -1232,15 +1469,16 @@ int sccp_session_send2(constSessionPtr session, sccp_msg_t * msg)
 	struct messageinfo * msginfo = lookupMsgInfoStruct(msgid);
 	if(msginfo) {
 		if(msginfo->messageId != msgid) {
-			pbx_log(LOG_ERROR, "%s: (session_send2) messageId %d (0x%x) unknown. matched:0x%x discarding message.\n", DEV_ID_LOG(s->device), msgid, msgid, msginfo->messageId);
+			pbx_log(LOG_ERROR, "%s: (session_send2) messageId %d (0x%x) unknown. matched:0x%x discarding message.\n", DEV_ID_LOG(send_device), msgid, msgid, msginfo->messageId);
+			sccp_free(msg);
 			return -4;
 		}
 		if(msginfo->type == SKINNY_MSGTYPE_REQUEST) {
 			request_pending(s);
-			sccp_log(DEBUGCAT_SOCKET)(VERBOSE_PREFIX_3 "%s: Request '%s' to device Pending\n", DEV_ID_LOG(s->device), msginfo->text);
+			sccp_log(DEBUGCAT_SOCKET)(VERBOSE_PREFIX_3 "%s: Request '%s' to device Pending\n", DEV_ID_LOG(send_device), msginfo->text);
 		}
 		if((GLOB(debug) & DEBUGCAT_MESSAGE) != 0) {
-			pbx_log(LOG_NOTICE, "%s: Sending Message: %s(0x%04X) %d bytes length\n", DEV_ID_LOG(s->device), msginfo->text, msgid, msg->header.length);
+			pbx_log(LOG_NOTICE, "%s: Sending Message: %s(0x%04X) %d bytes length\n", DEV_ID_LOG(send_device), msginfo->text, msgid, msg->header.length);
 			sccp_dump_msg(msg);
 		}
 	}
@@ -1262,17 +1500,46 @@ int sccp_session_send2(constSessionPtr session, sccp_msg_t * msg)
 			break;
 		}
 		bytesSent += res;
-	} while(bytesSent < bufLen && s && !s->session_stop && s->sc.fd > 0);
+	} while(bytesSent < bufLen && s && !__atomic_load_n(&s->session_stop, __ATOMIC_ACQUIRE) && s->sc.fd > 0);
 
 	sccp_free(msg);
 	msg = NULL;
 
 	if (bytesSent < bufLen) {
-		pbx_log(LOG_ERROR, "%s: Could only send %d of %d bytes!\n", DEV_ID_LOG(s->device), (int) bytesSent, (int) bufLen);
+		pbx_log(LOG_ERROR, "%s: Could only send %d of %d bytes!\n", DEV_ID_LOG(send_device), (int) bytesSent, (int) bufLen);
 		res = -1;
 	}
 
 	return res;
+}
+
+/* Direct sends (registration/token/keepalive replies) bypass the device
+ * lookup. Pin their session too, so an independent destructor cannot free
+ * the session during a network send. The owner worker also uses this path. */
+int sccp_session_send2(constSessionPtr session, sccp_msg_t *msg)
+{
+	sccp_session_t *active = NULL;
+	sccp_session_t *pinned = NULL;
+	int result;
+	if (!msg) {
+		return -1;
+	}
+	SCCP_RWLIST_RDLOCK(&GLOB(sessions));
+	SCCP_RWLIST_TRAVERSE(&GLOB(sessions), active, list) {
+		if (active == session && !__atomic_load_n(&active->session_stop, __ATOMIC_ACQUIRE)) {
+			pinned = active;
+			__atomic_add_fetch(&pinned->device_send_users, 1, __ATOMIC_ACQ_REL);
+			break;
+		}
+	}
+	SCCP_RWLIST_UNLOCK(&GLOB(sessions));
+	if (!pinned) {
+		sccp_free(msg);
+		return -2;
+	}
+	result = sccp_session_send2_pinned(pinned, msg);
+	sccp_session_release_send_user(pinned);
+	return result;
 }
 
 /*!
@@ -1300,24 +1567,47 @@ sccp_session_t *sccp_session_reject(constSessionPtr session, char *message)
  * \param previous_session SCCP Session Pointer
  * \param token Do we need to return a token reject or a session reject (as Boolean)
  */
-void sccp_session_crossdevice_cleanup(constSessionPtr current_session, sessionPtr previous_session)
+void sccp_session_crossdevice_cleanup(constSessionPtr current_session, constDevicePtr device)
 {
-	if (!current_session || !previous_session) {
+	sccp_session_t *old = NULL;
+	if (!current_session || !device) {
 		return;
 	}
-	if (current_session != previous_session && previous_session->session_thread) {
-		sccp_log(DEBUGCAT_CORE) (VERBOSE_PREFIX_2 "%s: Session %p needs to be closed!\n", current_session->designator, previous_session->designator);
-		__sccp_netsock_end_device_thread(previous_session);
+	/* A device->session pointer may become stale immediately after it is read.
+	 * Find the owner and request shutdown under the same lock used to change
+	 * ownership and to unlink sessions before freeing them. */
+	SCCP_RWLIST_RDLOCK(&GLOB(sessions));
+	SCCP_RWLIST_TRAVERSE(&GLOB(sessions), old, list) {
+		if (old != current_session && old->device == device &&
+		    device->session == old && __atomic_load_n(&old->session_thread, __ATOMIC_ACQUIRE) != AST_PTHREADT_NULL) {
+			sccp_log(DEBUGCAT_CORE) (VERBOSE_PREFIX_2 "%s: Requesting previous session %p shutdown\n", current_session->designator, (void *)old);
+			__atomic_store_n(&old->session_stop, TRUE, __ATOMIC_RELEASE);
+			if (old->sc.fd > 0) {
+				shutdown(old->sc.fd, SHUT_RD);
+			}
+			break;
+		}
 	}
+	SCCP_RWLIST_UNLOCK(&GLOB(sessions));
 }
 
 gcc_inline boolean_t sccp_session_check_crossdevice(constSessionPtr session, constDevicePtr device)
 {
-	if (session && device && ((session->device && session->device != device) || (device->session && device->session != session))) {
-		pbx_log(LOG_WARNING, "Session(%p) and Device Session(%p) are out of sync.\n", session, device->session);
-		return TRUE;
+	boolean_t mismatch = FALSE;
+	const sccp_session_t *owner = NULL;
+	/* Ownership is published and detached under the sessions list lock. */
+	if (!session || !device) {
+		return FALSE;
 	}
-	return FALSE;
+	SCCP_RWLIST_RDLOCK(&GLOB(sessions));
+	owner = device->session;
+	mismatch = (session->device && session->device != device) ||
+	           (owner && owner != session);
+	SCCP_RWLIST_UNLOCK(&GLOB(sessions));
+	if (mismatch) {
+		pbx_log(LOG_WARNING, "Session(%p) and Device Session(%p) are out of sync.\n", (void *)session, (void *)owner);
+	}
+	return mismatch;
 }
 
 /*!
@@ -1437,13 +1727,20 @@ gcc_inline devicePtr sccp_session_getDevice(constSessionPtr session, boolean_t r
 	if (!session) {
 		return NULL;
 	}
-	sccp_device_t *device = (session->device) ? sccp_device_retain(session->device) : NULL;
+	sessionPtr locked_session = (sessionPtr)session;
+	sccp_device_t *device = NULL;
+	/* ReleaseDevice detaches under the same session lock. */
+	sccp_session_lock(locked_session);
+	if (locked_session->device) {
+		device = sccp_device_retain(locked_session->device);
+	}
+	sccp_session_unlock(locked_session);
 	if (required && !device) {
 		pbx_log(LOG_WARNING, "No valid Session Device available\n");
 		return NULL;
 	}
 	if (required && sccp_session_check_crossdevice(session, device)) {
-		sccp_session_crossdevice_cleanup(session, device->session);
+		sccp_session_crossdevice_cleanup(session, device);
 		sccp_device_release(&device);							/* explicit release after error */
 		return NULL;
 	}
@@ -1452,7 +1749,7 @@ gcc_inline devicePtr sccp_session_getDevice(constSessionPtr session, boolean_t r
 
 boolean_t sccp_session_isValid(constSessionPtr session)
 {
-	if(session && session->sc.fd > 0 && !session->session_stop && !sccp_netsock_is_any_addr(&session->ourip)) {
+	if(session && session->sc.fd > 0 && !__atomic_load_n(&session->session_stop, __ATOMIC_ACQUIRE) && !sccp_netsock_is_any_addr(&session->ourip)) {
 		return TRUE;
 	}
 	return FALSE;

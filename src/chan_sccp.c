@@ -262,6 +262,9 @@ int sccp_preUnload(void)
 #if HAVE_LIBSSL
 	sccp_servercontext_stopListening(GLOB(srvcontexts[SCCP_SERVERCONTEXT_TLS]));
 #endif
+	/* Drain detached SCCP workers while devices, lines, and refcounts still
+	 * exist.  stopListening joined both accept threads above. */
+	sccp_session_quiesceAll();
 	sccp_hint_module_stop();
 
 	sccp_log((DEBUGCAT_CORE)) (VERBOSE_PREFIX_2 "SCCP: Hangup open channels\n");				//! \todo make this pbx independend

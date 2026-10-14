@@ -1167,14 +1167,14 @@ int sccp_astgenwrap_channel_read(PBX_CHANNEL_TYPE * ast, NEWCONST char *funcname
 	/* handle params */
 	if (!strcasecmp(args.param, "peerip")) {
 		struct sockaddr_storage sas = { 0 };
-		if (sccp_session_getOurIP(d->session, &sas, 0)) {
+		if (sccp_session_getDeviceOurIP(d, &sas, 0)) {
 			sccp_copy_string(buf, sccp_netsock_stringify(&sas), buflen);
 		} else {
 			sccp_copy_string(buf, "--", buflen);
 		}
 	} else if (!strcasecmp(args.param, "recvip")) {
 		struct sockaddr_storage sas = { 0 };
-		if (sccp_session_getSas(d->session, &sas)) {
+		if (sccp_session_getDeviceSas(d, &sas)) {
 			sccp_copy_string(buf, sccp_netsock_stringify(&sas), buflen);
 		} else {
 			sccp_copy_string(buf, "--", buflen);

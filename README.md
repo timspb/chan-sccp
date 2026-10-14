@@ -8,6 +8,60 @@ It is a compact fork-focused README with the basics only: build, install, and us
 
 English | [Русский](README.ru.md)
 
+## Enhanced SCCP Stability for Unreliable Networks
+
+This fork of [timspb/chan-sccp](https://github.com/timspb/chan-sccp)
+focuses on improving Cisco SCCP phone reliability over unstable
+network connections, including VPN links and intermittent connectivity.
+
+### Key Improvements
+
+- **Automatic registration recovery** after temporary TCP connection loss.
+- **Stale session cleanup** to prevent old SCCP sessions from blocking registration.
+- **Improved reconnection handling** when a phone reconnects before its previous session is fully released.
+- **Safer session synchronization** to reduce race conditions during registration and disconnection.
+- **Improved resource management** for device references, session ownership and worker threads.
+- **Reduced risk of persistent registration failures** requiring manual phone restarts.
+
+### Tested Environment
+
+| Component | Configuration |
+|---|---|
+| PBX | FreePBX 17 |
+| Asterisk | 22.11.0 |
+| Channel driver | chan_sccp |
+| Phones | Cisco 7912, Cisco 7937 |
+| Network | Routed VPN connection |
+| SCCP devices | 17 successfully registered |
+
+### Recovery Tests
+
+The following scenarios were tested with a Cisco 7912:
+
+- TCP connection forcibly terminated on the PBX.
+- A 90-second interruption of server-to-phone TCP traffic.
+- Automatic registration recovery without manually rebooting the phone.
+- Other SCCP devices remained registered during the network interruption.
+
+Both recovery scenarios completed successfully.
+
+### Development Status
+
+**Experimental — stability testing in progress.**
+
+The modifications improve SCCP session recovery but have not yet
+been validated against every possible network failure scenario.
+
+Tested recovery patch: [`454b9309`](https://github.com/sk0nstantin/chan-sccp/commit/454b9309).
+
+### Project Origins
+
+- [Original chan-sccp project](https://github.com/chan-sccp/chan-sccp)
+- [timspb fork](https://github.com/timspb/chan-sccp)
+- [This fork](https://github.com/sk0nstantin/chan-sccp)
+
+---
+
 Known-good target range for this fork:
 
 - FreePBX 16 or 17

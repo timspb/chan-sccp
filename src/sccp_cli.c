@@ -906,7 +906,7 @@ static int sccp_show_devices(int fd, sccp_cli_totals_t *totals, struct mansessio
 				struct timeval when = { d->registrationTime, 0 };                            \
 				ast_localtime (&when, &tm, NULL);                                            \
 				ast_strftime (regtime, sizeof (regtime), "%c ", &tm);                        \
-				sccp_session_getSas (d->session, &sas);                                      \
+				sccp_session_getDeviceSas(d, &sas);                                      \
 				sccp_copy_string (addrStr, sccp_netsock_stringify (&sas), sizeof (addrStr)); \
 			} else {                                                                             \
 				addrStr[0] = '-';                                                            \
@@ -1012,12 +1012,11 @@ static int sccp_show_device(int fd, sccp_cli_totals_t *totals, struct mansession
 #endif
 	sccp_print_ha(ha_buf, DEFAULT_PBX_STR_BUFFERSIZE, d->ha);
 
-	if (d->session) {
-		struct sockaddr_storage sas = { 0 };
-		sccp_session_getSas(d->session, &sas);
+	struct sockaddr_storage sas = { 0 };
+	if (sccp_session_getDeviceSas(d, &sas)) {
 		sccp_copy_string(clientAddress, sccp_netsock_stringify(&sas), sizeof(clientAddress));
 		struct sockaddr_storage ourip = { 0 };
-		sccp_session_getOurIP(d->session, &ourip, 0);
+		sccp_session_getDeviceOurIP(d, &ourip, 0);
 		sccp_copy_string(serverAddress, sccp_netsock_stringify(&ourip), sizeof(serverAddress));
 	} else {
 		snprintf(clientAddress, sizeof(clientAddress), "%s", "???.???.???.???");
@@ -2101,7 +2100,7 @@ static int sccp_test(int fd, int argc, char *argv[])
 			char xmlData2[2000];
 
 			struct sockaddr_storage ourip = { 0 };
-			sccp_session_getOurIP(d->session, &ourip, 0);
+			sccp_session_getDeviceOurIP(d, &ourip, 0);
 			snprintf(xmlData2, sizeof(xmlData2), xmlData1, sccp_netsock_stringify(&ourip));
 
 			d->protocol->sendUserToDeviceDataVersionMessage(d, 1, 0, 0, 1, xmlData2, 1);
@@ -2134,7 +2133,7 @@ static int sccp_test(int fd, int argc, char *argv[])
 			if (sccp_device_getRegistrationState(d) == SKINNY_DEVICE_RS_OK) {
 				if (argc < 5) {
 					struct sockaddr_storage sas = { 0 };
-					sccp_session_getSas(d->session, &sas);
+					sccp_session_getDeviceSas(d, &sas);
 					sccp_copy_string(clientAddress, sccp_netsock_stringify_addr(&sas), sizeof(clientAddress));
 				} else {
 					sccp_copy_string(clientAddress, argv[6], sizeof(clientAddress));
@@ -3413,7 +3412,11 @@ static int sccp_reset_restart(int fd, int argc, char *argv[])
 	int res = 0;
 	res = sccp_device_sendReset(d, type);
 	if (res <= 0 && type != SKINNY_RESETTYPE_APPLYCONFIG) {
-		sccp_session_stopthread(d->session, SKINNY_DEVICE_RS_NONE);
+		sccp_session_t *active = sccp_session_pinDeviceSession(d);
+		if (active) {
+			sccp_session_stopthread(active, SKINNY_DEVICE_RS_NONE);
+			sccp_session_releasePinnedSession(active);
+		}
 	}
 	
 	return RESULT_SUCCESS;
@@ -3955,9 +3958,11 @@ static int sccp_tokenack(int fd, sccp_cli_totals_t *totals, struct mansession *s
 		pbx_log(LOG_WARNING, "%s: We need to have received a token request before we can acknowledge it\n", dev);
 		CLI_AMI_RETURN_ERROR(fd, s, m, "%s: We need to have received a token request before we can acknowledge it\n", dev);		/* explicit return */
 	} 
-	if (d->session) {
+	sccp_session_t *active = sccp_session_pinDeviceSession(d);
+	if (active) {
 		sccp_log((DEBUGCAT_CORE)) (VERBOSE_PREFIX_3 "%s: Sending phone a token acknowledgement\n", dev);
-		sccp_session_tokenAck(d->session);
+		sccp_session_tokenAck(active);
+		sccp_session_releasePinnedSession(active);
 	} else {
 		sccp_log((DEBUGCAT_CORE)) (VERBOSE_PREFIX_3 "%s: Phone not connected to this server (no valid session)\n", dev);
 	}

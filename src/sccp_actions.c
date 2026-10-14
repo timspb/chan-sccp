@@ -273,7 +273,9 @@ int sccp_handle_message(constMessagePtr msg, constSessionPtr s)
  */
 void sccp_handle_backspace(constDevicePtr d, const uint8_t lineInstance, const uint32_t callid)
 {
-	pbx_assert(d != NULL && d->session != NULL);
+	/* A disconnect can race this UI response. The send helper checks the
+	 * session association and drops the packet if no owner remains. */
+	pbx_assert(d != NULL);
 	sccp_msg_t *msg_out = NULL;
 
 	REQ(msg_out, BackSpaceResMessage);
@@ -532,10 +534,10 @@ void handle_token_request(constSessionPtr s, devicePtr no_d, constMessagePtr msg
 			if (sccp_session_check_crossdevice(s, tmpdevice) || (state != SKINNY_DEVICE_RS_FAILED && state != SKINNY_DEVICE_RS_NONE)) {
 				pbx_log(LOG_NOTICE, "%s: Cleaning previous session, come back later (tokenState:%s)\n", deviceName, skinny_registrationstate2str(state));
 				tmpdevice->registrationTime = time(0);
-				sccp_session_crossdevice_cleanup(s, tmpdevice->session);
+				sccp_session_crossdevice_cleanup(s, tmpdevice);
 				sccp_session_tokenReject(s, 10);
 				sccp_session_stopthread(s, SKINNY_DEVICE_RS_FAILED);
-				tmpdevice->session = NULL;
+				/* Previous worker releases its own session association. */
 				return;
 			}
 		}
@@ -719,11 +721,11 @@ void handle_SPCPTokenReq(constSessionPtr s, devicePtr no_d, constMessagePtr msg_
 			}
 			if (sccp_session_check_crossdevice(s, tmpdevice) || (state != SKINNY_DEVICE_RS_FAILED && state != SKINNY_DEVICE_RS_NONE)) {
 				pbx_log(LOG_NOTICE, "%s: Cleaning previous session, come back later (tokenState:%s)\n", deviceName, skinny_registrationstate2str(state));
-				sccp_session_crossdevice_cleanup(s, tmpdevice->session);
+				sccp_session_crossdevice_cleanup(s, tmpdevice);
 				tmpdevice->registrationTime = time(0);
 				sccp_session_tokenRejectSPCP(s, 10);
 				sccp_session_stopthread(s, SKINNY_DEVICE_RS_FAILED);
-				tmpdevice->session = NULL;
+				/* Previous worker releases its own session association. */
 				return;
 			}
 		}
@@ -764,11 +766,11 @@ void handle_SPCPTokenReq(constSessionPtr s, devicePtr no_d, constMessagePtr msg_
 	}
 
 	/* obsolete, see above */
-	if (device->session && device->session != s) {
+	if (sccp_session_check_crossdevice(s, device)) {
 		pbx_log(LOG_NOTICE, "%s: Crossover device registration!\n", device->id);
-		sccp_device_setRegistrationState(device, SKINNY_DEVICE_RS_FAILED);
 		sccp_session_tokenRejectSPCP(s, token_backoff_time);
-		device->session = sccp_session_reject(device->session, "Crossover session not allowed");
+		/* Never reject or overwrite another worker's session. */
+		sccp_session_stopthread(s, SKINNY_DEVICE_RS_FAILED);
 		goto EXIT;
 	}
 
@@ -839,10 +841,9 @@ void handle_register(constSessionPtr s, devicePtr maybe_d, constMessagePtr msg_i
 			(state == SKINNY_DEVICE_RS_TOKEN && time(0) - device->registrationTime > 60)
 		) {
 			pbx_log(LOG_WARNING, "%s: Cleaning previous session, come back later, state:%s\n", DEV_ID_LOG(device), skinny_registrationstate2str(state));
-			sccp_session_crossdevice_cleanup(s, device->session);
-			sccp_session_reject(s, "Crossover session");
-			sccp_device_setRegistrationState(device, SKINNY_DEVICE_RS_FAILED);
-			device->session = NULL;
+			sccp_session_crossdevice_cleanup(s, device);
+			/* Transient crossover: no terminal RegisterReject on Cisco 7912.
+			 * Stop this incoming connection and allow a fresh retry. */
 			goto FUNC_EXIT;
 		}
 	}
@@ -867,8 +868,9 @@ void handle_register(constSessionPtr s, devicePtr maybe_d, constMessagePtr msg_i
 
 	if (device) {
 		if (sccp_session_retainDevice(s, device) < 0) {
-			pbx_log(LOG_WARNING, "%s: Signing over the session to new device failed. Giving up.\n", DEV_ID_LOG(device));
-			sccp_session_reject(s, "register failed");
+			/* Busy ownership after the preflight check is a retryable race,
+			 * not proof of a device/authentication error. */
+			pbx_log(LOG_WARNING, "%s: Device session busy during register; retry on fresh connection\n", DEV_ID_LOG(device));
 			goto FUNC_EXIT;
 		}
 
@@ -1009,9 +1011,7 @@ FUNC_EXIT:
 #endif
 */
 	sccp_session_stopthread(s, SKINNY_DEVICE_RS_FAILED);
-	if (device) {
-		device->session = NULL;
-	}
+	/* Do not detach a different worker on the failure path. */
 }
 
 /*!

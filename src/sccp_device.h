@@ -148,6 +148,9 @@ struct sccp_device {
 
 	sccp_nat_t nat;												/*!< Network Address Translation Support (Boolean, default=on) */
 	sccp_session_t *session;										/*!< Current Session */
+	/* Guarded by GLOB(sessions) RW lock, including the NULL -> non-NULL handoff. */
+	boolean_t session_owner_transition;						/*!< Owner detached or cleanup in progress */
+	boolean_t cleanup_in_progress;						/*!< Protected by GLOB(sessions) */
 	SCCP_RWLIST_ENTRY (sccp_device_t) list;									/*!< Global Device Linked List */
 
 	sccp_private_device_data_t *privateData;
@@ -405,6 +408,8 @@ SCCP_API void SCCP_CALL sccp_dev_cleardisplayprinotify(constDevicePtr d, const u
 SCCP_API void SCCP_CALL sccp_dev_speed_find_byindex(constDevicePtr d, const uint16_t instance, boolean_t withHint, sccp_speed_t * const k);
 SCCP_API void SCCP_CALL sccp_dev_forward_status(constLinePtr l, uint8_t lineInstance, constDevicePtr device);
 SCCP_API void SCCP_CALL _sccp_dev_clean(devicePtr device, boolean_t remove_from_global, boolean_t restart_device);
+/* Clean an exiting session only if it still owns the device at cleanup start. */
+SCCP_API void SCCP_CALL _sccp_dev_clean_owned(devicePtr device, boolean_t remove_from_global, boolean_t restart_device, constSessionPtr expected_owner);
 #define sccp_dev_clean(d, r) _sccp_dev_clean(d, r, FALSE);
 #define sccp_dev_clean_restart(d, r) _sccp_dev_clean(d, r, TRUE);
 SCCP_API void SCCP_CALL sccp_dev_keypadbutton(devicePtr d, char digit, uint8_t line, uint32_t callid);

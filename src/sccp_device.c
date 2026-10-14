@@ -54,6 +54,8 @@ void sccp_device_removeFromGlobals(devicePtr device);
  */
 struct sccp_private_device_data {
 	sccp_mutex_t lock;
+	/* Serialize complete cleanup including line/channel callbacks. */
+	sccp_mutex_t cleanup_lock;
 	
 	sccp_accessorystate_t accessoryStatus[SCCP_ACCESSORY_SENTINEL + 1];		
 	sccp_devicestate_t deviceState;											/*!< Device State */
@@ -327,12 +329,9 @@ static boolean_t sccp_device_checkACL(constDevicePtr device)
 	struct sockaddr_storage sas = { 0 };
 	boolean_t matchesACL = FALSE;
 
-	if (!device || !device->session) {
+	if (!sccp_session_getDeviceSas(device, &sas)) {
 		return FALSE;
 	}
-
-	/* get current socket information */
-	sccp_session_getSas(device->session, &sas);
 
 	/* no permit deny information */
 	if (!device->ha) {
@@ -595,8 +594,9 @@ int sccp_device_setRegistrationState(constDevicePtr d, const skinny_registration
 	if (iPbx.endpoint_online && iPbx.endpoint_offline) {
 		if (SKINNY_DEVICE_RS_OK == state) {
 			struct sockaddr_storage ourip = { 0 };
-			sccp_session_getOurIP(d->session, &ourip, 0);
-			iPbx.endpoint_online(d->endpoint, sccp_netsock_stringify(&ourip));
+			if (sccp_session_getDeviceOurIP(d, &ourip, 0)) {
+				iPbx.endpoint_online(d->endpoint, sccp_netsock_stringify(&ourip));
+			}
 		} else if (SKINNY_DEVICE_RS_NONE == state) {
 			iPbx.endpoint_offline(d->endpoint, "Unreachable");
 		} else {
@@ -638,8 +638,11 @@ devicePtr sccp_device_create(const char * id)
 		return NULL;
 	}
 	d->privateData = private_data;
+	d->session_owner_transition = FALSE;
+	d->cleanup_in_progress = FALSE;
 	d->privateData->registrationState = SKINNY_DEVICE_RS_NONE;
 	sccp_mutex_init(&d->privateData->lock);
+	sccp_mutex_init(&d->privateData->cleanup_lock);
 		
 	sccp_copy_string(d->id, id, sizeof(d->id));
 	SCCP_LIST_HEAD_INIT(&d->buttonconfig);
@@ -1346,7 +1349,8 @@ int sccp_dev_send(constDevicePtr d, sccp_msg_t * msg)
 {
 	int result = -1;
 
-	if (d && d->session && msg) {
+	/* The session can be detached concurrently; sccp_session_send() pins it. */
+	if (d && msg) {
 		sccp_log((DEBUGCAT_MESSAGE))(VERBOSE_PREFIX_3 "%s: >> Send message %s\n", d->id, msginfo2str(letohl(msg->header.lel_messageId)));
 		result = sccp_session_send(d, msg);
 	} else {
@@ -1389,7 +1393,13 @@ void sccp_dev_set_registered(devicePtr d, skinny_registrationstate_t state)
 	if (state == SKINNY_DEVICE_RS_OK) {
 		if (!d->linesRegistered) {
 			sccp_log((DEBUGCAT_DEVICE)) (VERBOSE_PREFIX_3 "%s: Device does not support RegisterAvailableLinesMessage, force this\n", DEV_ID_LOG(d));
-			sccp_handle_AvailableLines(d->session, d, NULL);
+			{
+                    sccp_session_t *active = sccp_session_pinDeviceSession(d);
+                    if (active) {
+                        sccp_handle_AvailableLines(active, d, NULL);
+                        sccp_session_releasePinnedSession(active);
+                    }
+                }
 		}
 		sccp_dev_postregistration(d);
 	} else if (state == SKINNY_DEVICE_RS_PROGRESS) {
@@ -2185,7 +2195,13 @@ void sccp_dev_forward_status(constLinePtr l, uint8_t lineInstance, constDevicePt
 			AUTO_RELEASE(sccp_device_t, d , sccp_device_retain(device));
 			if (d) {
 				sccp_log((DEBUGCAT_DEVICE)) (VERBOSE_PREFIX_3 "%s: Device does not support RegisterAvailableLinesMessage, forcing this\n", DEV_ID_LOG(device));
-				sccp_handle_AvailableLines(d->session, d, NULL);
+				{
+                    sccp_session_t *active = sccp_session_pinDeviceSession(d);
+                    if (active) {
+                        sccp_handle_AvailableLines(active, d, NULL);
+                        sccp_session_releasePinnedSession(active);
+                    }
+                }
 				d->linesRegistered = TRUE;
 			}
 		}
@@ -2404,13 +2420,34 @@ static void sccp_buttonconfig_destroy(sccp_buttonconfig_t *buttonconfig)
  */
 void _sccp_dev_clean(devicePtr device, boolean_t remove_from_global, boolean_t restart_device)
 {
+	_sccp_dev_clean_owned(device, remove_from_global, restart_device, NULL);
+}
+
+void _sccp_dev_clean_owned(devicePtr device, boolean_t remove_from_global,
+		boolean_t restart_device, constSessionPtr expected_owner)
+{
 	AUTO_RELEASE(sccp_device_t, d , sccp_device_retain(device));
 	sccp_buttonconfig_t *config = NULL;
 	sccp_selectedchannel_t *selectedChannel = NULL;
 	sccp_channel_t *c = NULL;
 	int i = 0;
 
-	if(d) {
+	if(d && d->privateData) {
+		/* A lifetime reference keeps privateData and cleanup_lock allocated.
+		 * The global sessions lock protects ownership checks and prevents a
+		 * new registration while cleanup callbacks run. The per-device mutex
+		 * serializes simultaneous cleanup initiated by reload and disconnect. */
+		sccp_mutex_lock(&d->privateData->cleanup_lock);
+		SCCP_RWLIST_WRLOCK(&GLOB(sessions));
+		if (expected_owner && d->session != expected_owner) {
+			SCCP_RWLIST_UNLOCK(&GLOB(sessions));
+			sccp_mutex_unlock(&d->privateData->cleanup_lock);
+			return;
+		}
+		d->cleanup_in_progress = TRUE;
+		d->session_owner_transition = TRUE;
+		SCCP_RWLIST_UNLOCK(&GLOB(sessions));
+
 		sccp_log((DEBUGCAT_CORE + DEBUGCAT_DEVICE)) (VERBOSE_PREFIX_1 "SCCP: Clean Device %s, remove from global:%s, restart_device:%s\n", d->id, remove_from_global ? "Yes" : "No", restart_device ? "Yes" : "No");
 		sccp_device_setRegistrationState(d, SKINNY_DEVICE_RS_CLEANING);
 		if (remove_from_global) {
@@ -2527,17 +2564,20 @@ void _sccp_dev_clean(devicePtr device, boolean_t remove_from_global, boolean_t r
 		if (device->lineButtons.size) {
 			sccp_linedevice_deleteButtonsArray(d);
 		}
-		sccp_session_t *s = d->session;
-		if (s) {
-			if (restart_device) {
-				sccp_device_sendReset(d, SKINNY_RESETTYPE_RESTART);
-				//sccp_safe_sleep(100);
-			}
-			sccp_session_releaseDevice(s);
-			d->session = NULL;
-			sccp_session_stopthread(s, SKINNY_DEVICE_RS_NONE);
+		/* The old worker can free its session at any point. Do not read
+		 * d->session here without pinning it against teardown. */
+		if (restart_device) {
+			sccp_device_sendReset(d, SKINNY_RESETTYPE_RESTART);
 		}
 		sccp_device_setRegistrationState(d, SKINNY_DEVICE_RS_NONE);
+		sccp_session_cleanupDeviceSession(d);
+		/* Device ownership remains blocked until all cleanup callbacks and
+		 * session detach have completed. Do not hold GLOB(sessions) over them. */
+		SCCP_RWLIST_WRLOCK(&GLOB(sessions));
+		d->cleanup_in_progress = FALSE;
+		d->session_owner_transition = FALSE;
+		SCCP_RWLIST_UNLOCK(&GLOB(sessions));
+		sccp_mutex_unlock(&d->privateData->cleanup_lock);
 /*
 #if CS_REFCOUNT_DEBUG
 		if (remove_from_global) {
@@ -2656,6 +2696,7 @@ int __sccp_device_destroy(const void *ptr)
 			sccp_device_destroyiconv(d);
 		}
 #endif	
+		sccp_mutex_destroy(&d->privateData->cleanup_lock);
 		sccp_mutex_destroy(&d->privateData->lock);
 		sccp_free(d->privateData);
 	}
@@ -2888,8 +2929,12 @@ static void sccp_device_indicate_onhook(constDevicePtr device, const uint8_t lin
 
 	sccp_device_sendcallstate(device, lineInstance, callid, SKINNY_CALLSTATE_ONHOOK, SKINNY_CALLPRIORITY_LOW, SKINNY_CALLINFO_VISIBILITY_DEFAULT);
 	sccp_dev_set_keyset(device, 0, 0, KEYMODE_ONHOOK);				/* reset the keyset of the base instance instead of current lineInstance + callid*/
-	if (device->session) {
-		sccp_handle_time_date_req(device->session, (sccp_device_t *) device, NULL);	/** we need datetime on hangup for 7936 */
+	{
+		sccp_session_t *active = sccp_session_pinDeviceSession(device);
+		if (active) {
+			sccp_handle_time_date_req(active, (sccp_device_t *) device, NULL); /* 7936 */
+			sccp_session_releasePinnedSession(active);
+		}
 	}
 
 	sccp_device_clearMessageFromStack((sccp_device_t *) device, SCCP_MESSAGE_PRIORITY_PRIVACY);
@@ -2989,8 +3034,12 @@ static void sccp_device_indicate_onhook_remote(constDevicePtr device, const uint
 	sccp_dev_set_keyset(device, lineInstance, callid, KEYMODE_ONHOOK);
 	sccp_dev_set_cplane(device, lineInstance, 0);
 	sccp_dev_set_keyset(device, lineInstance, callid, KEYMODE_ONHOOK);
-	if (device->session) {
-		sccp_handle_time_date_req(device->session, (sccp_device_t *) device, NULL);	/** we need datetime on hangup for 7936 */
+	{
+		sccp_session_t *active = sccp_session_pinDeviceSession(device);
+		if (active) {
+			sccp_handle_time_date_req(active, (sccp_device_t *) device, NULL); /* 7936 */
+			sccp_session_releasePinnedSession(active);
+		}
 	}
 }
 

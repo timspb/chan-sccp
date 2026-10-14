@@ -541,8 +541,12 @@ channelPtr sccp_pbx_hangup(constChannelPtr channel)
 	sccp_log_and((DEBUGCAT_PBX + DEBUGCAT_CHANNEL))(VERBOSE_PREFIX_3 "%s: Asked to hangup channel.\n", c->designator);
 
 	AUTO_RELEASE(sccp_device_t, d , sccp_channel_getDevice(c));
-	if(d && d->session) {
-		sccp_session_waitForPendingRequests(d->session);
+	if (d) {
+		sccp_session_t *active = sccp_session_pinDeviceSession(d);
+		if (active) {
+			sccp_session_waitForPendingRequests(active);
+			sccp_session_releasePinnedSession(active);
+		}
 		/*		if (
 					GLOB(remotehangup_tone) &&
 					SKINNY_DEVICE_RS_OK == sccp_device_getRegistrationState(d) &&
@@ -996,8 +1000,7 @@ boolean_t sccp_pbx_channel_allocate(constChannelPtr channel, const void * ids, c
 		// export sccp informations in asterisk dialplan
 		pbx_builtin_setvar_helper(tmp, "SCCP_DEVICE_MAC", d->id);
 		struct sockaddr_storage sas = { 0 };
-		sccp_session_getSas(d->session, &sas);
-		pbx_builtin_setvar_helper(tmp, "SCCP_DEVICE_IP", d->session ? sccp_netsock_stringify_addr(&sas) : "");
+		pbx_builtin_setvar_helper(tmp, "SCCP_DEVICE_IP", sccp_session_getDeviceSas(d, &sas) ? sccp_netsock_stringify_addr(&sas) : "");
 		pbx_builtin_setvar_helper(tmp, "SCCP_DEVICE_TYPE", skinny_devicetype2str(d->skinny_type));
 	}
 	sccp_log((DEBUGCAT_PBX + DEBUGCAT_CHANNEL)) (VERBOSE_PREFIX_3 "%s: Allocated asterisk channel %s\n", (l) ? l->id : "(null)", c->designator);

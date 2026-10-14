@@ -428,11 +428,8 @@ static int sccp_func_sccpdevice(PBX_CHANNEL_TYPE * chan, NEWCONST char * cmd, ch
 			/** */
 
 			if (!strcasecmp(token, "ip")) {
-				sccp_session_t * s = d->session;
-
-				if (s) {
-					struct sockaddr_storage sas = { 0 };
-					sccp_session_getOurIP(s, &sas, 0);
+				struct sockaddr_storage sas = { 0 };
+				if (sccp_session_getDeviceOurIP(d, &sas, 0)) {
 					sccp_copy_string(buf, sccp_netsock_stringify(&sas), buf_len);
 				}
 			} else if (!strcasecmp(token, "id")) {
@@ -544,15 +541,13 @@ static int sccp_func_sccpdevice(PBX_CHANNEL_TYPE * chan, NEWCONST char * cmd, ch
 			} else if (!strcasecmp(token, "pending_update")) {
 				sccp_copy_string(buf, d->pendingUpdate ? "yes" : "no", buf_len);
 			} else if (!strcasecmp(token, "peerip")) {                                        // NO-NAT (Ip-Address Associated with the Session->sin)
-				if (d->session) {
-					struct sockaddr_storage sas = { 0 };
-					sccp_session_getOurIP(d->session, &sas, 0);
+				struct sockaddr_storage sas = { 0 };
+				if (sccp_session_getDeviceOurIP(d, &sas, 0)) {
 					sccp_copy_string(buf, sccp_netsock_stringify(&sas), len);
 				}
 			} else if (!strcasecmp(token, "recvip")) {                                        // NAT (Actual Source IP-Address Reported by the phone upon registration)
-				if (d->session) {
-					struct sockaddr_storage sas = { 0 };
-					sccp_session_getSas(d->session, &sas);
+				struct sockaddr_storage sas = { 0 };
+				if (sccp_session_getDeviceSas(d, &sas)) {
 					sccp_copy_string(buf, sccp_netsock_stringify(&sas), len);
 				}
 			} else if (!strcasecmp(colname, "rtpqos")) {
@@ -1012,14 +1007,14 @@ static int sccp_func_sccpchannel(PBX_CHANNEL_TYPE * chan, NEWCONST char * cmd, c
 				AUTO_RELEASE(sccp_device_t, d, sccp_channel_getDevice(c));
 				if (d) {
 					struct sockaddr_storage sas = { 0 };
-					sccp_session_getOurIP(d->session, &sas, 0);
+					sccp_session_getDeviceOurIP(d, &sas, 0);
 					sccp_copy_string(buf, sccp_netsock_stringify(&sas), len);
 				}
 			} else if (!strcasecmp(token, "recvip")) {                                        // NAT (Actual Source IP-Address Reported by the phone upon registration)
 				AUTO_RELEASE(sccp_device_t, d, sccp_channel_getDevice(c));
 				if (d) {
 					struct sockaddr_storage sas = { 0 };
-					sccp_session_getSas(d->session, &sas);
+					sccp_session_getDeviceSas(d, &sas);
 					sccp_copy_string(buf, sccp_netsock_stringify(&sas), len);
 				}
 			} else if (!strcasecmp(colname, "rtpqos")) {

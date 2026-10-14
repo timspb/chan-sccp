@@ -146,7 +146,7 @@ boolean_t sccp_rtp_createServer(constDevicePtr d, channelPtr c, sccp_rtp_type_t 
 	}
 
 	uint16_t port = sccp_rtp_getServerPort(rtp);
-	sccp_session_getOurIP(d->session, phone_remote, 0);
+	sccp_session_getDeviceOurIP(d, phone_remote, 0);
 	sccp_netsock_setPort(phone_remote, port);
 
 	if (ast_test_flag(GLOB(global_jbconf), AST_JB_ENABLED)) {
@@ -363,7 +363,7 @@ void sccp_rtp_set_phone(constChannelPtr c, rtpPtr rtp, struct sockaddr_storage *
 			/* Rewrite ip-addres to the outside source address using the phones connection (device->sin) */
 			sccp_copy_string(peerIpStr, sccp_netsock_stringify(new_peer), sizeof(peerIpStr));
 			uint16_t port = sccp_netsock_getPort(new_peer);
-			sccp_session_getSas(device->session, new_peer);
+			sccp_session_getDeviceSas(device, new_peer);
 			sccp_netsock_ipv4_mapped(new_peer, new_peer);
 			sccp_netsock_setPort(new_peer, port);
 		}
@@ -401,7 +401,7 @@ int sccp_rtp_updateNatRemotePhone(constChannelPtr c, rtpPtr rtp)
 	if (d) {
 		struct sockaddr_storage   sus          = { 0 };
 		struct sockaddr_storage * phone_remote = &rtp->phone_remote;
-		sccp_session_getOurIP(d->session, &sus, 0);
+		sccp_session_getDeviceOurIP(d, &sus, 0);
 
 		uint16_t usFamily     = (sccp_netsock_is_IPv6(&sus) && !sccp_netsock_is_mapped_IPv4(&sus)) ? AF_INET6 : AF_INET;
 		uint16_t remoteFamily = (sccp_netsock_is_IPv6(phone_remote) && !sccp_netsock_is_mapped_IPv4(phone_remote)) ? AF_INET6 : AF_INET;

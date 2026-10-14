@@ -16,6 +16,7 @@
 #include "sccp_actions.h"
 #include "sccp_device.h"
 #include "sccp_indicate.h"
+#include "sccp_session.h"
 #include "sccp_line.h"
 #include "sccp_linedevice.h"
 #include "sccp_utils.h"
@@ -317,8 +318,12 @@ void __sccp_indicate (constDevicePtr maybe_device, channelPtr c, const sccp_chan
 		case SCCP_CHANNELSTATE_HOLD:
 			{
 				sccp_channel_closeAllMediaTransmitAndReceive(c);
-				if (d->session) {
-					sccp_handle_time_date_req(d->session, d, NULL);
+				{
+					sccp_session_t *active = sccp_session_pinDeviceSession(d);
+					if (active) {
+						sccp_handle_time_date_req(active, d, NULL);
+						sccp_session_releasePinnedSession(active);
+					}
 				}
 				sccp_device_setLamp(d, SKINNY_STIMULUS_LINE, lineInstance, SKINNY_LAMP_WINK);
 				sccp_device_sendcallstate(d, lineInstance, c->callid, SKINNY_CALLSTATE_HOLD, SKINNY_CALLPRIORITY_LOW, SKINNY_CALLINFO_VISIBILITY_DEFAULT);	/* send connected, so it is not listed as missed call */

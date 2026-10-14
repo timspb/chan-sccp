@@ -416,7 +416,7 @@ static int sccp_manager_show_devices(struct mansession *s, const struct message 
 		ast_localtime (&when, &tm, NULL);
 
 		struct sockaddr_storage sas = { 0 };
-		if (sccp_session_getSas(device->session, &sas)) {
+		if (sccp_session_getDeviceSas(device, &sas)) {
 			sccp_copy_string(clientAddress, sccp_netsock_stringify(&sas), sizeof(clientAddress));
 		} else {
 			sccp_copy_string(clientAddress, "--", sizeof(clientAddress));
@@ -697,15 +697,14 @@ static int sccp_manager_device_update(struct mansession *s, const struct message
 		return 0;
 	}
 
-	if (!d->session) {
+	sccp_session_t *active = sccp_session_pinDeviceSession(d);
+	if (!active) {
 		astman_send_error(s, m, "Device not active");
 		return 0;
 	}
-
-	sccp_handle_soft_key_template_req(d->session, d, NULL);
-
-	sccp_handle_button_template_req(d->session, d, NULL);
-
+	sccp_handle_soft_key_template_req(active, d, NULL);
+	sccp_handle_button_template_req(active, d, NULL);
+	sccp_session_releasePinnedSession(active);
 	astman_send_ack(s, m, "Done");
 	return 0;
 }
